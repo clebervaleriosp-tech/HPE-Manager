@@ -1,82 +1,54 @@
 const express = require('express');
-const path = require('path');
+const path = require('node:path');
+const { LocalHistoryStore } = require('./services/LocalHistoryStore');
+const { SimulatorUpdateProvider } = require('./services/SimulatorUpdateProvider');
+const { RedfishUpdateProvider } = require('./services/RedfishUpdateProvider');
+const { UpdateService } = require('./services/UpdateService');
+const { MockProvider } = require('./services/MockProvider');
+const { RedfishInventoryProvider } = require('./services/RedfishInventoryProvider');
+const { HpeIloProvider } = require('./services/HpeIloProvider');
+const { DellIdracProvider } = require('./services/DellIdracProvider');
+const { IpmiProvider } = require('./services/IpmiProvider');
+const { AutomationService } = require('./services/AutomationService');
+const { PackageCatalogService } = require('./services/PackageCatalogService');
+const { validateServer } = require('./services/validators');
+const { filterInventory, toCsv } = require('./services/ReportService');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+const initialServers = [
+  ['srv-01','DL360G10-PRD-01','10.20.1.11','Producao','Producao'],['srv-02','DL360G10-PRD-02','10.20.1.12','Producao','Producao'],['srv-03','DL360G10-HML-01','10.20.2.21','Homologacao','Homologacao'],['srv-04','DL360G10-HML-02','10.20.2.22','Homologacao','Homologacao'],['srv-05','DL360G10-DEV-01','10.20.3.31','Desenvolvimento','Desenvolvimento'],['srv-06','DL360G10-DR-01','10.20.4.41','Disaster Recovery','DR'],['srv-07','DL360G10-DR-02','10.20.4.42','Disaster Recovery','DR']
+].map(([id,nome,endereco,grupo,ambiente],n) => ({ id,nome,endereco,ip:endereco,portaHttps:443,grupo,ambiente,fabricante:n===1?'Dell':n===2?'Generico':'HPE',modelo:n===1?'Dell PowerEdge R650':n===2?'Servidor Generico':'HPE ProLiant DL360 Gen10',observacoes:'Inventario de laboratorio',estado:id === 'srv-04' ? 'offline' : 'online',backup:id !== 'srv-05',janela:id !== 'srv-06',saude:id === 'srv-05' ? 'critica' : id === 'srv-02' ? 'aviso' : 'adequada' }));
+const bundles = [{ id: 'spp-2026-03', nome: 'SPP 2026.03 - Homologado', bios: 'U30 v2.68', ilo: 'iLO 5 v3.10', smartArray: 'v3.00' }];
+const localUsers = [{ usuario: 'visualizador', senha: 'visualizar', nome: 'Usuario Visualizacao', papel: 'visualizacao' }, { usuario: 'operador', senha: 'operar', nome: 'Operador Local', papel: 'operador' }, { usuario: 'admin', senha: 'administrar', nome: 'Administrador Local', papel: 'administrador' }];
 
-const servidores = [
-  { id: 'srv-01', nome: 'DL360G10-PRD-01', ip: '10.20.1.11', estado: 'online', bios: 'U30 v2.60', ilo: 'iLO 5 v2.81', saude: 'adequada', grupo: 'Produção', backup: true, janela: true },
-  { id: 'srv-02', nome: 'DL360G10-PRD-02', ip: '10.20.1.12', estado: 'online', bios: 'U30 v2.54', ilo: 'iLO 5 v2.77', saude: 'aviso', grupo: 'Produção', backup: true, janela: true },
-  { id: 'srv-03', nome: 'DL360G10-HML-01', ip: '10.20.2.21', estado: 'online', bios: 'U30 v2.50', ilo: 'iLO 5 v2.70', saude: 'adequada', grupo: 'Homologação', backup: true, janela: true },
-  { id: 'srv-04', nome: 'DL360G10-HML-02', ip: '10.20.2.22', estado: 'offline', bios: 'U30 v2.42', ilo: 'iLO 5 v2.65', saude: 'adequada', grupo: 'Homologação', backup: true, janela: true },
-  { id: 'srv-05', nome: 'DL360G10-DEV-01', ip: '10.20.3.31', estado: 'online', bios: 'U30 v2.40', ilo: 'iLO 5 v2.60', saude: 'critica', grupo: 'Desenvolvimento', backup: false, janela: true },
-  { id: 'srv-06', nome: 'DL360G10-DR-01', ip: '10.20.4.41', estado: 'online', bios: 'U30 v2.58', ilo: 'iLO 5 v2.79', saude: 'adequada', grupo: 'Disaster Recovery', backup: true, janela: false },
-  { id: 'srv-07', nome: 'DL360G10-DR-02', ip: '10.20.4.42', estado: 'online', bios: 'U30 v2.60', ilo: 'iLO 5 v2.81', saude: 'adequada', grupo: 'Disaster Recovery', backup: true, janela: true }
-];
-const bundles = [{ id: 'spp-2026-03', nome: 'SPP 2026.03 — Homologado', bios: 'U30 v2.68', ilo: 'iLO 5 v3.10', smartArray: 'v3.00' }];
-const lotes = [];
-
-function validar(ids) {
-  return ids.map(id => {
-    const servidor = servidores.find(s => s.id === id);
-    if (!servidor) return { id, classificacao: 'bloqueado', checks: [], motivo: 'Servidor não localizado.' };
-    const checks = [
-      { nome: 'Servidor online', ok: servidor.estado === 'online', bloqueia: true },
-      { nome: 'Saúde do hardware adequada', ok: servidor.saude === 'adequada', bloqueia: servidor.saude === 'critica' },
-      { nome: 'Backup de configuração', ok: servidor.backup, bloqueia: true },
-      { nome: 'Janela de manutenção aprovada', ok: servidor.janela, bloqueia: true },
-      { nome: 'Impacto: reinicialização necessária', ok: true, aviso: true }
-    ];
-    const bloqueado = checks.some(c => !c.ok && c.bloqueia);
-    const aviso = !bloqueado && checks.some(c => c.aviso || !c.ok);
-    return { id, servidor, checks, classificacao: bloqueado ? 'bloqueado' : aviso ? 'aviso' : 'apto' };
-  });
+function createApp({ store = new LocalHistoryStore(), stepDelay, uploadDir = path.join(__dirname, 'uploads') } = {}) {
+  const app = express(); const tokens = new Map(); let updateService;
+  const data = store.load(); data.servidores ||= structuredClone(initialServers); data.lotes ||= []; data.auditoria ||= []; data.pacotes ||= [];
+  const persist = () => store.save(data); const audit = event => { data.auditoria.unshift({ id:`audit-${Date.now()}-${Math.random().toString(16).slice(2)}`, horario:new Date().toISOString(), ...event }); persist(); };
+  const simulatedUpdateProvider = new SimulatorUpdateProvider({ servidores: data.servidores, stepDelay, onChange: () => updateService.onLotChange() });
+  updateService = new UpdateService({ servidores: data.servidores, bundles, store: { load: () => data, save: persist }, provider: simulatedUpdateProvider }); updateService.data = data;
+  const mockInventory = new MockProvider(); const redfishInventory = new RedfishInventoryProvider(); const redfishUpdate = new RedfishUpdateProvider(); const catalog = new PackageCatalogService({ data, persist, uploadDir }); const automation = new AutomationService({data,persist,audit});
+  app.use(express.json()); app.use(express.static(path.join(__dirname, 'public')));
+  app.post('/api/auth/login', (req,res) => { const found = localUsers.find(u => u.usuario === req.body.usuario && u.senha === req.body.senha); if (!found) return res.status(401).json({erro:'Usuario ou senha invalidos.'}); const usuario={nome:found.nome,usuario:found.usuario,papel:found.papel}; const token=`local-${Date.now()}-${Math.random().toString(16).slice(2)}`; tokens.set(token,usuario); res.json({token,usuario}); });
+  const auth = (roles=[]) => (req,res,next) => { const user=tokens.get(req.header('x-local-token')); if(!user)return res.status(401).json({erro:'Autenticacao local necessaria.'}); if(roles.length&&!roles.includes(user.papel))return res.status(403).json({erro:'Seu perfil nao possui permissao para esta acao.'}); req.user=user; next(); };
+  const inventory = () => data.servidores.map(s => ({...s,...mockInventory.collect(s)}));
+  app.get('/api/me',auth(),(req,res)=>res.json({usuario:req.user}));
+  app.get('/api/servidores',auth(),(_req,res)=>res.json({servidores:inventory(),bundles,provider:simulatedUpdateProvider.name,simulacao:true}));
+  app.get('/api/servidores/:id',auth(),(req,res)=>{const server=inventory().find(s=>s.id===req.params.id);if(!server)return res.status(404).json({erro:'Servidor nao encontrado.'});res.json({servidor:server,automacoes:automation.operations(req.user)});});
+  app.post('/api/servidores',auth(['administrador']),(req,res)=>{ const errors=validateServer(req.body); if(errors.length)return res.status(400).json({erro:errors.join(' ')}); const server={id:`srv-${Date.now()}`,nome:req.body.nome.trim(),endereco:req.body.endereco.trim(),ip:req.body.endereco.trim(),portaHttps:Number(req.body.portaHttps),grupo:req.body.grupo||'Sem grupo',ambiente:req.body.ambiente||'Laboratorio',modelo:req.body.modelo.trim(),observacoes:req.body.observacoes||'',estado:'online',backup:true,janela:true,saude:'adequada'}; data.servidores.push(server); audit({acao:'cadastro-servidor',usuario:req.user,servidorId:server.id,resultado:'criado'}); res.status(201).json({servidor:server}); });
+  app.put('/api/servidores/:id',auth(['administrador']),(req,res)=>{ const server=data.servidores.find(s=>s.id===req.params.id); if(!server)return res.status(404).json({erro:'Servidor nao encontrado.'}); const errors=validateServer(req.body); if(errors.length)return res.status(400).json({erro:errors.join(' ')}); Object.assign(server,{nome:req.body.nome.trim(),endereco:req.body.endereco.trim(),ip:req.body.endereco.trim(),portaHttps:Number(req.body.portaHttps),grupo:req.body.grupo||'Sem grupo',ambiente:req.body.ambiente||'Laboratorio',modelo:req.body.modelo.trim(),observacoes:req.body.observacoes||''}); audit({acao:'edicao-servidor',usuario:req.user,servidorId:server.id,resultado:'atualizado'}); res.json({servidor:server}); });
+  app.delete('/api/servidores/:id',auth(['administrador']),(req,res)=>{ const index=data.servidores.findIndex(s=>s.id===req.params.id); if(index<0)return res.status(404).json({erro:'Servidor nao encontrado.'}); const [removed]=data.servidores.splice(index,1); audit({acao:'remocao-servidor',usuario:req.user,servidorId:removed.id,resultado:'removido'}); res.status(204).end(); });
+  app.patch('/api/servidores/:id/cenario',auth(['operador','administrador']),(req,res)=>{const server=data.servidores.find(s=>s.id===req.params.id);if(!server)return res.status(404).json({erro:'Servidor nao encontrado.'});if(!['normal','offline','critico','desatualizado','incompativel'].includes(req.body.cenario))return res.status(400).json({erro:'Cenario invalido.'});server.cenario=req.body.cenario==='normal'?null:req.body.cenario;audit({acao:'cenario-laboratorio',usuario:req.user,alvo:server.id,resultado:req.body.cenario});res.json({servidor:mockInventory.collect(server)});});
+  app.post('/api/servidores/:id/automacoes/:operation',auth(),(req,res)=>{try{const server=data.servidores.find(s=>s.id===req.params.id);if(!server)return res.status(404).json({erro:'Servidor nao encontrado.'});res.json({operacao:automation.execute({server,user:req.user,operation:req.params.operation})});}catch(e){res.status(403).json({erro:e.message});}});
+  app.post('/api/servidores/importar',auth(['administrador']),(req,res)=>{ if(!Array.isArray(req.body.servidores))return res.status(400).json({erro:'Envie um array servidores.'}); const valid=req.body.servidores.map(s=>({s,errors:validateServer(s)})); const invalid=valid.filter(x=>x.errors.length); if(invalid.length)return res.status(400).json({erro:`Importacao cancelada: ${invalid.length} registro(s) invalido(s).`}); const novos=valid.map(({s},i)=>({id:`srv-${Date.now()}-${i}`,nome:s.nome.trim(),endereco:s.endereco.trim(),ip:s.endereco.trim(),portaHttps:Number(s.portaHttps),grupo:s.grupo||'Sem grupo',ambiente:s.ambiente||'Laboratorio',modelo:s.modelo.trim(),observacoes:s.observacoes||'',estado:'online',backup:true,janela:true,saude:'adequada'})); data.servidores.push(...novos); audit({acao:'importacao-servidores',usuario:req.user,quantidade:novos.length,resultado:'importado'}); res.status(201).json({importados:novos.length}); });
+  app.get('/api/pacotes',auth(),(_req,res)=>res.json({pacotes:catalog.list()}));
+  app.post('/api/pacotes/upload',auth(['administrador']),express.raw({type:'application/octet-stream',limit:'50mb'}),(req,res)=>{ try { const pacote=catalog.upload({buffer:req.body,filename:req.header('x-filename'),fabricante:req.query.fabricante||'HPE',tipo:req.query.tipo,versao:req.query.versao,modeloAlvo:req.query.modeloAlvo,user:req.user}); audit({acao:'upload-pacote',usuario:req.user,pacoteId:pacote.id,tipo:pacote.tipo,versao:pacote.versao,resultado:'pendente'}); res.status(201).json({pacote}); } catch(e){res.status(400).json({erro:e.message});} });
+  app.patch('/api/pacotes/:id/status',auth(['administrador']),(req,res)=>{ try { const pacote=catalog.status(req.params.id,req.body.status,req.user); audit({acao:'homologacao-pacote',usuario:req.user,pacoteId:pacote.id,status:pacote.status,resultado:pacote.status}); res.json({pacote}); } catch(e){res.status(400).json({erro:e.message});} });
+  app.get('/api/relatorios',auth(),(req,res)=>{ const items=filterInventory(inventory(),req.query); audit({acao:'geracao-relatorio',usuario:req.user,filtros:req.query,quantidade:items.length,resultado:'gerado'}); res.json({itens:items,quantidade:items.length}); });
+  app.get('/api/relatorios/exportar',auth(),(req,res)=>{ const items=filterInventory(inventory(),req.query); const format=req.query.formato==='csv'?'csv':'json'; audit({acao:'exportacao-relatorio',usuario:req.user,formato:format,quantidade:items.length,resultado:'exportado'}); if(format==='csv'){res.type('text/csv').attachment('relatorio-hpe-manager.csv').send(toCsv(items));}else res.attachment('relatorio-hpe-manager.json').json(items); });
+  app.post('/api/lotes/validar',auth(['operador','administrador']),(req,res)=>{const ids=Array.isArray(req.body.servidores)?req.body.servidores:[];if(!ids.length)return res.status(400).json({erro:'Selecione pelo menos um servidor.'});res.json(updateService.validate(ids,req.user));});
+  app.post('/api/lotes/executar',auth(['operador','administrador']),(req,res)=>{try{res.status(201).json({lote:updateService.execute({ids:Array.isArray(req.body.servidores)?req.body.servidores:[],bundleId:req.body.bundle,concorrencia:req.body.concorrencia,user:req.user})});}catch(e){res.status(400).json({erro:e.message});}});
+  app.get('/api/lotes',auth(),(_req,res)=>res.json(updateService.lots())); app.get('/api/auditoria',auth(['administrador']),(_req,res)=>res.json({auditoria:data.auditoria,operacoes:data.operacoes||[]})); app.get('/api/providers',auth(['administrador']),(_req,res)=>res.json({execucaoRealBloqueada:true,atualizacao:{ativo:simulatedUpdateProvider.name,redfish:{nome:redfishUpdate.name,habilitado:false}},inventario:{ativo:mockInventory.name,redfish:{nome:redfishInventory.name,habilitado:false},adaptadores:[{nome:new HpeIloProvider().name,habilitado:false},{nome:new DellIdracProvider().name,habilitado:false},{nome:new IpmiProvider().name,habilitado:false}]}}));
+  return app;
 }
-
-function registrar(lote, servidorId, estado, mensagem) {
-  const item = lote.servidores.find(s => s.id === servidorId);
-  item.estado = estado;
-  item.progresso = ({ pendente: 0, validando: 10, atualizando: 55, reiniciando: 82, concluido: 100, falhou: 100 })[estado];
-  item.logs.push({ horario: new Date().toLocaleTimeString('pt-BR'), mensagem });
-  lote.atualizadoEm = new Date().toISOString();
-}
-function executarServidor(lote, item, indice) {
-  const etapas = [
-    ['validando', 'Validações finais do lote iniciadas.'],
-    ['atualizando', 'Aplicando componentes do bundle homologado.'],
-    ['reiniciando', 'Reinicialização controlada em andamento.'],
-    ['concluido', 'Atualização simulada concluída com sucesso.']
-  ];
-  etapas.forEach(([estado, msg], pos) => setTimeout(() => {
-    if (estado === 'concluido' && item.nome.includes('PRD-02')) registrar(lote, item.id, 'falhou', 'Falha simulada: validação pós-reinicialização excedeu o tempo limite.');
-    else registrar(lote, item.id, estado, msg);
-    if (estado === 'concluido') {
-      const acabaram = lote.servidores.every(s => ['concluido', 'falhou', 'bloqueado'].includes(s.estado));
-      if (acabaram) { lote.status = 'finalizado'; lote.finalizadoEm = new Date().toISOString(); }
-    }
-  // Cada grupo só começa depois da onda anterior encerrar: concorrência real simulada.
-  }, 800 + (indice * 5_200) + (pos * 1200)));
-}
-
-app.get('/api/servidores', (_req, res) => res.json({ servidores, bundles }));
-app.post('/api/lotes/validar', (req, res) => {
-  const ids = Array.isArray(req.body.servidores) ? req.body.servidores : [];
-  if (!ids.length) return res.status(400).json({ erro: 'Selecione pelo menos um servidor.' });
-  const resultados = validar(ids);
-  res.json({ resultados, resumo: ['apto', 'bloqueado', 'aviso'].reduce((a, k) => ({ ...a, [k]: resultados.filter(r => r.classificacao === k).length }), {}) });
-});
-app.post('/api/lotes/executar', (req, res) => {
-  const ids = Array.isArray(req.body.servidores) ? req.body.servidores : [];
-  const bundle = bundles.find(b => b.id === req.body.bundle);
-  if (!bundle || !ids.length) return res.status(400).json({ erro: 'Bundle e servidores são obrigatórios.' });
-  const resultados = validar(ids);
-  const lote = { id: `lote-${Date.now()}`, nome: `Lote ${new Date().toLocaleString('pt-BR')}`, bundle, status: 'em andamento', iniciadoEm: new Date().toISOString(), atualizadoEm: new Date().toISOString(), concorrencia: Math.min(Math.max(Number(req.body.concorrencia) || 2, 1), 3), servidores: resultados.map(r => ({ id: r.id, nome: r.servidor?.nome || r.id, estado: r.classificacao === 'bloqueado' ? 'bloqueado' : 'pendente', progresso: 0, logs: r.classificacao === 'bloqueado' ? [{ horario: new Date().toLocaleTimeString('pt-BR'), mensagem: 'Bloqueado pelas validações prévias.' }] : [{ horario: new Date().toLocaleTimeString('pt-BR'), mensagem: 'Aguardando vaga de concorrência.' }] })) };
-  lotes.unshift(lote);
-  lote.servidores.filter(s => s.estado === 'pendente').forEach((item, i) => executarServidor(lote, item, Math.floor(i / lote.concorrencia)));
-  if (!lote.servidores.some(s => s.estado === 'pendente')) lote.status = 'finalizado';
-  res.status(201).json({ lote });
-});
-app.get('/api/lotes', (_req, res) => res.json({ lotes }));
-app.listen(PORT, () => console.log(`HPE Manager em http://localhost:${PORT}`));
+if(require.main===module){const port=process.env.PORT||3000;createApp().listen(port,()=>console.log(`HPE Manager em http://localhost:${port}`));}
+module.exports={createApp,initialServers};

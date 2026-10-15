@@ -1,0 +1,11 @@
+class UpdateService {
+  constructor({ servidores, bundles, store, provider }) { this.servidores = servidores; this.bundles = bundles; this.store = store; this.data = store.load(); this.provider = provider; }
+  persist() { this.store.save(this.data); }
+  inventory() { return { servidores: this.servidores, bundles: this.bundles, provider: this.provider.name, simulacao: true }; }
+  validate(ids, user) { const resultados = this.provider.validate(ids); const resumo = ['apto', 'bloqueado', 'aviso'].reduce((a, k) => ({ ...a, [k]: resultados.filter(r => r.classificacao === k).length }), {}); this.audit({ acao: 'validacao', usuario: user, servidores: ids, validacoes: resultados, resultado: resumo }); return { resultados, resumo }; }
+  execute({ ids, bundleId, concorrencia, user }) { const bundle = this.bundles.find(b => b.id === bundleId); if (!bundle || !ids.length) throw new Error('Bundle e servidores sao obrigatorios.'); const validation = this.provider.validate(ids); const lote = { id: `lote-${Date.now()}`, nome: `Lote ${new Date().toLocaleString('pt-BR')}`, bundle, status: 'em andamento', iniciadoEm: new Date().toISOString(), atualizadoEm: new Date().toISOString(), usuario: user.nome, concorrencia: Math.min(Math.max(Number(concorrencia) || 2, 1), 3), validacoes: validation, servidores: validation.map(r => ({ id: r.id, nome: r.servidor?.nome || r.id, estado: r.classificacao === 'bloqueado' ? 'bloqueado' : 'pendente', progresso: 0, logs: [{ horario: new Date().toISOString(), mensagem: r.classificacao === 'bloqueado' ? 'Bloqueado pelas validacoes previas.' : 'Aguardando vaga de concorrencia.' }], motivoFalha: r.classificacao === 'bloqueado' ? r.checks.filter(c => !c.ok).map(c => c.nome).join('; ') : null })) }; this.data.lotes.unshift(lote); this.audit({ acao: 'execucao', usuario: user, bundle, servidores: ids, validacoes: validation, resultado: 'lote iniciado', loteId: lote.id }); this.persist(); this.provider.run(lote); return lote; }
+  onLotChange() { this.persist(); }
+  audit(event) { this.data.auditoria.unshift({ id: `audit-${Date.now()}-${Math.random().toString(16).slice(2)}`, horario: new Date().toISOString(), ...event }); this.persist(); }
+  lots() { return { lotes: this.data.lotes }; }
+}
+module.exports = { UpdateService };

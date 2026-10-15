@@ -1,0 +1,3 @@
+function filterInventory(items, filters = {}) { return items.filter(item => ['grupo', 'ambiente', 'bios', 'ilo', 'saude'].every(key => !filters[key] || item[key] === filters[key]) && (!filters.alertas || (filters.alertas === 'com-alertas' ? item.alertas.length > 0 : item.alertas.length === 0))); }
+function toCsv(items) { const cols = ['nome', 'endereco', 'portaHttps', 'grupo', 'ambiente', 'modelo', 'bios', 'ilo', 'saude', 'alertas', 'ultimaColeta']; const escape = value => `"${String(value ?? '').replaceAll('"', '""')}"`; return [cols.join(','), ...items.map(row => cols.map(c => escape(c === 'alertas' ? row.alertas.join(' | ') : row[c])).join(','))].join('\n'); }
+module.exports = { filterInventory, toCsv };
